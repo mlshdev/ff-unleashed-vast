@@ -1,0 +1,159 @@
+# ============================================================================
+# FaceFusion on Vast.ai - Minimal Build
+# Built from source using official NVIDIA base image
+# Target: linux/amd64 only
+# ============================================================================
+
+# ------------------------------------------------------------------------------
+# Stage 1: Download FFmpeg static build
+# ------------------------------------------------------------------------------
+FROM alpine:latest AS ffmpeg-downloader
+
+RUN apk add --no-cache aria2 xz
+
+WORKDIR /tmp
+
+RUN aria2c -x 16 -s 16 -k 1M \
+    https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+    && tar -xf ffmpeg-master-latest-linux64-gpl.tar.xz \
+    && mv ffmpeg-master-latest-linux64-gpl/bin/* /usr/local/bin/
+
+# ------------------------------------------------------------------------------
+# Stage 2: Download Python dependencies (no compilation needed)
+# ------------------------------------------------------------------------------
+# All FaceFusion deps have pre-built manylinux wheels - no build tools required
+# Using glibc-based Debian (NOT Alpine/musl - wheels incompatible with Ubuntu runtime)
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS python-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends aria2 xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Install TensorRT first (large package) - pre-built wheel, no CUDA needed
+RUN uv pip install --target=/packages \
+    tensorrt==10.12.0.36 --extra-index-url https://pypi.nvidia.com
+
+# Download latest release from GitLab (uses permalink to always get latest)
+RUN aria2c -x 16 -s 16 -k 1M -o ff-unleashed.tar.xz \
+    "https://gitlab.com/mlshdev/ff-unleashed/-/releases/permalink/latest/downloads/releases.tar.xz" \
+    && tar -xJf ff-unleashed.tar.xz \
+    && rm ff-unleashed.tar.xz
+
+# Install FaceFusion + dependencies from extracted release
+RUN uv pip install --target=/packages -e . \
+    && uv pip install --target=/packages onnxruntime-gpu
+
+# Pre-download essential ONNX models for faster cold start
+# Models are downloaded in parallel using aria2c
+RUN mkdir -p .assets/models && cd .assets/models && aria2c -x 16 -j 8 -s 16 -k 1M \
+    # Face detector
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/retinaface_10g.onnx \
+    # Face landmarker
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/2dfan4.onnx \
+    # Face recognizer
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/arcface_w600k_r50.onnx \
+    # Face classifier
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/fairface.onnx \
+    # Face swapper
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/blendswap_256.onnx \
+    # Face enhancer
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/gpen_bfr_2048.onnx \
+    # Face occluder
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.2.0/xseg_3.onnx \
+    # Face parser
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/bisenet_resnet_34.onnx \
+    # Live Portrait suite
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_motion_extractor.onnx \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_feature_extractor.onnx \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_generator.onnx \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_eye_retargeter.onnx \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_lip_retargeter.onnx \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_stitcher.onnx
+
+# Download hash files for validation
+RUN cd .assets/models && aria2c -x 16 -j 16 -s 16 \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/retinaface_10g.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/2dfan4.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/arcface_w600k_r50.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/fairface.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/blendswap_256.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/gpen_bfr_2048.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.2.0/xseg_3.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/bisenet_resnet_34.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_motion_extractor.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_feature_extractor.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_generator.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_eye_retargeter.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_lip_retargeter.hash \
+    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/live_portrait_stitcher.hash
+
+# ------------------------------------------------------------------------------
+# Stage 3: Final runtime image
+# ------------------------------------------------------------------------------
+FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
+
+LABEL org.opencontainers.image.description="FaceFusion on Vast.ai (Minimal)"
+LABEL maintainer="Your Name <your@email.com>"
+
+# ============================================================================
+# Environment
+# ============================================================================
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    WORKSPACE=/workspace \
+    # Vast.ai: Makes "Open" button point to FaceFusion Gradio UI
+    OPEN_BUTTON_PORT=7860 \
+    GRADIO_SERVER_NAME=0.0.0.0 \
+    GRADIO_SERVER_PORT=7860 \
+    PYTHONPATH=/packages \
+    LD_LIBRARY_PATH=/packages/tensorrt_libs:${LD_LIBRARY_PATH}
+
+# ============================================================================
+# Install minimal runtime packages only
+# ============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    openssh-server \
+    supervisor \
+    # OpenCV runtime dependencies
+    libgl1 \
+    libglib2.0-0 \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================================================
+# Setup SSH for Vast.ai
+# ============================================================================
+RUN mkdir -p /var/run/sshd /root/.ssh \
+    && chmod 700 /root/.ssh \
+    && sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
+    && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+
+# ============================================================================
+# Copy built artifacts
+# ============================================================================
+COPY --from=ffmpeg-downloader /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg-downloader /usr/local/bin/ffprobe /usr/local/bin/ffprobe
+COPY --from=python-builder /packages /packages
+COPY --from=python-builder /build /opt/facefusion
+
+# ============================================================================
+# Copy configuration files
+# ============================================================================
+COPY config/supervisor/supervisord.conf /etc/supervisor/supervisord.conf
+COPY config/supervisor/conf.d/ /etc/supervisor/conf.d/
+COPY scripts/entrypoint.sh /entrypoint.sh
+
+RUN chmod +x /entrypoint.sh \
+    && mkdir -p /var/log/supervisor
+
+# ============================================================================
+# Expose ports and set workdir
+# ============================================================================
+EXPOSE 22 7860
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/entrypoint.sh"]

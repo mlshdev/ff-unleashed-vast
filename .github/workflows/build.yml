@@ -1,0 +1,172 @@
+name: Build FaceFusion Dockerimage
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Force build even if no new release"
+        required: false
+        default: false
+        type: boolean
+      version:
+        description: "Specific version to build (e.g., 3.5.2)"
+        required: false
+        type: string
+
+concurrency:
+  group: ff-unleashed-vast-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY_GHCR: ghcr.io
+  REGISTRY_DOCKER: docker.io
+  IMAGE_NAME: ${{ github.repository }} # owner/repo
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Check for new FaceFusion release (gh) + check GHCR tag (GitHub Packages API)
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          # Resolve upstream FaceFusion version
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            VERSION="${INPUT_VERSION}"
+            echo "Using manually specified version: ${VERSION}"
+          else
+            VERSION="$(gh api repos/facefusion/facefusion/releases/latest --jq '.tag_name')"
+            echo "Latest upstream version: ${VERSION}"
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+          # Force build
+          if [[ "${FORCE_BUILD}" == "true" ]]; then
+            echo "Force build requested"
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Check whether GHCR already has this tag using GitHub Packages API
+          OWNER_TYPE="$(gh api users/${OWNER} --jq '.type')"
+
+          if [[ "${OWNER_TYPE}" == "Organization" ]]; then
+            ENDPOINT="/orgs/${OWNER}/packages/container/${REPO}/versions"
+          else
+            ENDPOINT="/users/${OWNER}/packages/container/${REPO}/versions"
+          fi
+
+          # If package doesn't exist yet, gh exits non-zero; treat as "should build"
+          TAGS="$(
+            gh api --paginate "${ENDPOINT}" --jq '.[].metadata.container.tags[]?' 2>/dev/null || true
+          )"
+
+          if echo "${TAGS}" | grep -Fxq "${VERSION}"; then
+            echo "Version ${VERSION} already exists in GHCR (via Packages API), skipping build"
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Version ${VERSION} not found in GHCR (via Packages API), will build"
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+  build-and-push:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Free Disk Space - Ubuntu Runners
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+          rm_cmd: "rmz"
+          rmz_version: "3.1.1"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate build timestamp
+        id: timestamp
+        run: echo "date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_DOCKER }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY_DOCKER }}/${{ secrets.DOCKERHUB_USERNAME }}/ff-unleashed-vast
+          tags: |
+            type=raw,value=${{ needs.check-release.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          cache-from: type=registry,ref=${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            FACEFUSION_VERSION=${{ needs.check-release.outputs.version }}
+            VERSION=${{ needs.check-release.outputs.version }}
+            BUILD_DATE=${{ steps.timestamp.outputs.date }}
+            VCS_REF=${{ github.sha }}
+      - name: Create release summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## FaceFusion ${{ needs.check-release.outputs.version }} (NSFW-Free)
+
+          ### Changes from upstream:
+          - ❌ NSFW content analyser disabled
+          - ❌ NSFW model downloads removed
+          - ❌ Hash integrity check bypassed
+
+          ### Images pushed to:
+          - `ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.check-release.outputs.version }}`
+          - `docker.io/${{ secrets.DOCKERHUB_USERNAME }}/ff-unleashed-vast:${{ needs.check-release.outputs.version }}`
+          EOF

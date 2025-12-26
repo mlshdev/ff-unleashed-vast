@@ -1,0 +1,20 @@
+# Build artifacts
+artifacts/
+
+# Logs
+*.log
+old/
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+volumes/
+
