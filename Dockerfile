@@ -112,9 +112,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GRADIO_SERVER_PORT=7860 \
     PYTHONPATH=/packages:/opt/facefusion \
     PATH=/opt/ffmpeg/bin:${PATH} \
-    LD_LIBRARY_PATH=/packages/tensorrt_libs:/opt/ffmpeg/lib:/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/lib:/usr/local/lib64:${LD_LIBRARY_PATH} \
+    LD_LIBRARY_PATH=/packages/tensorrt_libs:/opt/ffmpeg/lib:/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/lib:/usr/local/lib64:${LD_LIBRARY_PATH}
 
-    RUN apt-get update && apt-get install -y --no-install-recommends \
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     openssh-server \
     supervisor \
